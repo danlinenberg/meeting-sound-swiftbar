@@ -2,7 +2,6 @@
 
 A SwiftBar plugin that counts down to your next meeting in the macOS menu bar, then plays the Israeli Channel 12 (חדשות 12) news intro music as it hits zero.
 
-Inspired by [this tweet](https://x.com/rtwlz/status/2036082537949434164).
 
 ## How it works
 
