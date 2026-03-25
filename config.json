@@ -1,0 +1,13 @@
+{
+  "meetings": [
+    {
+      "name": "Team Sync",
+      "times": ["12:00"],
+      "days": ["sun", "mon", "tue", "wed", "thu"]
+    }
+  ],
+  "audio_file": "channel12-intro.mp3",
+  "lead_time_seconds": 33,
+  "red_threshold_seconds": 8,
+  "blink_threshold_seconds": 10
+}

@@ -1,0 +1,7 @@
+audio/*.mp3
+audio/*.m4a
+audio/*.wav
+.state/
+config.json.bak
+key-stopper
+key-stopper.py
