@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # <bitbar.title>Channel 12 Meeting Countdown</bitbar.title>
-# <bitbar.version>1.0</bitbar.version>
+# <bitbar.version>2.0</bitbar.version>
 # <bitbar.author>Dan</bitbar.author>
 # <bitbar.desc>Counts down to meetings with Channel 12 news intro music</bitbar.desc>
 # <swiftbar.hideRunInTerminal>true</swiftbar.hideRunInTerminal>
@@ -12,63 +12,92 @@ import signal
 import subprocess
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = SCRIPT_DIR / "config.json"
 STATE_DIR = SCRIPT_DIR / ".state"
 AUDIO_PLAYED_FLAG = STATE_DIR / "audio_played"
-KEY_STOPPER = SCRIPT_DIR / "key-stopper.py"
-KEY_STOPPER_PID_FILE = STATE_DIR / "key_stopper_pid"
 AUDIO_PID_FILE = STATE_DIR / "audio_pid"
+KEY_STOPPER_PID_FILE = STATE_DIR / "key_stopper_pid"
+CALENDAR_CACHE = STATE_DIR / "calendar_cache.json"
 
-DAY_MAP = {
-    0: "mon", 1: "tue", 2: "wed", 3: "thu", 4: "fri", 5: "sat", 6: "sun"
+LEAD_TIME = 33
+RED_THRESHOLD = 8
+BLINK_THRESHOLD = 10
+AUDIO_FILE = "channel12-intro.mp3"
+
+# Calendar calendars to skip
+SKIP_CALENDARS = {"Birthdays", "Siri Suggestions", "Scheduled Reminders"}
+
+JXA_SCRIPT = '''
+const app = Application('Calendar');
+const now = new Date();
+const later = new Date(now.getTime() + 24 * 3600000);
+const results = [];
+const skip = %s;
+const cals = app.calendars();
+for (let c of cals) {
+    if (skip.includes(c.name())) continue;
+    try {
+        const events = c.events.whose({startDate: {'>=': now, '<=': later}})();
+        for (let e of events) {
+            if (e.allDayEvent()) continue;
+            results.push({name: e.summary(), start: e.startDate().toISOString()});
+        }
+    } catch(e) {}
 }
+JSON.stringify(results);
+'''
 
 
 def load_config():
     if not CONFIG_PATH.exists():
-        return {
-            "meetings": [
-                {"name": "Team Sync", "times": ["12:00"], "days": ["sun", "mon", "tue", "wed", "thu"]}
-            ],
-            "audio_file": "channel12-intro.mp3",
-            "lead_time_seconds": 15,
-            "red_threshold_seconds": 8,
-        }
+        return {}
     with open(CONFIG_PATH) as f:
         return json.load(f)
 
 
-def get_next_meeting(config):
+def get_next_meeting_from_calendar():
+    """Query macOS Calendar for the next upcoming meeting."""
+    skip_list = json.dumps(list(SKIP_CALENDARS))
+    script = JXA_SCRIPT % skip_list
+
+    # Cache calendar results for 30 seconds to avoid hammering Calendar.app
+    now = time.time()
+    if CALENDAR_CACHE.exists():
+        try:
+            cache = json.loads(CALENDAR_CACHE.read_text())
+            if now - cache.get("ts", 0) < 30:
+                events = cache["events"]
+                return _pick_next(events)
+        except (json.JSONDecodeError, KeyError):
+            pass
+
+    try:
+        result = subprocess.run(
+            ["osascript", "-l", "JavaScript", "-e", script],
+            capture_output=True, text=True, timeout=5,
+        )
+        events = json.loads(result.stdout) if result.stdout.strip() else []
+    except Exception:
+        events = []
+
+    STATE_DIR.mkdir(exist_ok=True)
+    CALENDAR_CACHE.write_text(json.dumps({"ts": now, "events": events}))
+    return _pick_next(events)
+
+
+def _pick_next(events):
     now = datetime.now()
-    today_name = DAY_MAP[now.weekday()]
     candidates = []
-
-    for meeting in config["meetings"]:
-        days = meeting.get("days", ["sun", "mon", "tue", "wed", "thu", "fri", "sat"])
-
-        for day_offset in range(7):
-            check_date = now + timedelta(days=day_offset)
-            check_day = DAY_MAP[check_date.weekday()]
-
-            if check_day not in days:
-                continue
-
-            for time_str in meeting["times"]:
-                parts = list(map(int, time_str.split(":")))
-                h, m = parts[0], parts[1]
-                s = parts[2] if len(parts) > 2 else 0
-                meeting_dt = check_date.replace(hour=h, minute=m, second=s, microsecond=0)
-
-                if meeting_dt > now:
-                    candidates.append((meeting_dt, meeting["name"]))
-
+    for ev in events:
+        start = datetime.fromisoformat(ev["start"].replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
+        if start > now - timedelta(seconds=60):
+            candidates.append((start, ev["name"]))
     if not candidates:
         return None, None
-
     candidates.sort(key=lambda x: x[0])
     return candidates[0]
 
@@ -93,43 +122,25 @@ def is_audio_playing():
         return False
 
 
-def play_audio(config):
-    audio_file = SCRIPT_DIR / "audio" / config.get("audio_file", "channel12-intro.mp3")
-    if not audio_file.exists():
+def play_audio(audio_file):
+    path = SCRIPT_DIR / "audio" / audio_file
+    if not path.exists() or is_audio_playing():
         return
-
-    if is_audio_playing():
-        return
-
     try:
         proc = subprocess.Popen(
-            ["afplay", str(audio_file)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            ["afplay", str(path)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         STATE_DIR.mkdir(exist_ok=True)
         AUDIO_PID_FILE.write_text(str(proc.pid))
 
-        # Invisible window that catches any keypress and kills audio
         stopper = subprocess.Popen(
             [str(SCRIPT_DIR / "key-stopper"), str(proc.pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         KEY_STOPPER_PID_FILE.write_text(str(stopper.pid))
     except Exception:
         pass
-
-
-def mark_audio_played(meeting_key):
-    STATE_DIR.mkdir(exist_ok=True)
-    AUDIO_PLAYED_FLAG.write_text(meeting_key)
-
-
-def was_audio_played(meeting_key):
-    if not AUDIO_PLAYED_FLAG.exists():
-        return False
-    return AUDIO_PLAYED_FLAG.read_text().strip() == meeting_key
 
 
 def stop_audio():
@@ -143,9 +154,21 @@ def stop_audio():
             pid_file.unlink(missing_ok=True)
 
 
+def mark_audio_played(meeting_key):
+    STATE_DIR.mkdir(exist_ok=True)
+    AUDIO_PLAYED_FLAG.write_text(meeting_key)
+
+
+def was_audio_played(meeting_key):
+    if not AUDIO_PLAYED_FLAG.exists():
+        return False
+    return AUDIO_PLAYED_FLAG.read_text().strip() == meeting_key
+
+
 def clear_audio_state():
     stop_audio()
     AUDIO_PLAYED_FLAG.unlink(missing_ok=True)
+    CALENDAR_CACHE.unlink(missing_ok=True)
 
 
 SELF = str(Path(__file__).resolve())
@@ -155,19 +178,22 @@ def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--stop":
         stop_audio()
         return
+
     config = load_config()
-    meeting_dt, meeting_name = get_next_meeting(config)
+    lead_time = config.get("lead_time_seconds", LEAD_TIME)
+    red_threshold = config.get("red_threshold_seconds", RED_THRESHOLD)
+    blink_threshold = config.get("blink_threshold_seconds", BLINK_THRESHOLD)
+    audio_file = config.get("audio_file", AUDIO_FILE)
+
+    meeting_dt, meeting_name = get_next_meeting_from_calendar()
 
     if meeting_dt is None:
-        print("No meetings | size=15 font=Menlo-Bold")
+        print(":bell.fill: No meetings | size=15 font=Menlo-Bold")
         return
 
     now = datetime.now()
     seconds_left = (meeting_dt - now).total_seconds()
-    lead_time = config.get("lead_time_seconds", 15)
-    red_threshold = config.get("red_threshold_seconds", 8)
     meeting_key = f"{meeting_name}_{meeting_dt.isoformat()}"
-
     stop_cmd = f"bash={SELF} param1=--stop terminal=false refresh=true"
 
     # After meeting started - show "is live!" for 60 seconds
@@ -178,7 +204,7 @@ def main():
         print(f"Stop Music | {stop_cmd}")
         return
 
-    # Past the "is live!" window - clear state and show next meeting
+    # Past the "is live!" window - clear state
     if seconds_left <= -60:
         clear_audio_state()
 
@@ -186,22 +212,16 @@ def main():
     if seconds_left <= lead_time:
         countdown = format_countdown(seconds_left)
 
-        # Play audio once when entering lead time
         if not was_audio_played(meeting_key):
-            play_audio(config)
+            play_audio(audio_file)
             mark_audio_played(meeting_key)
 
-        blink_threshold = config.get("blink_threshold_seconds", 10)
         blink_on = int(time.time()) % 2 == 0
 
         if seconds_left <= blink_threshold:
-            # Rapid blink: alternate red/hidden
-            if blink_on:
-                print(f":bell.fill: {meeting_name} in {countdown} | color=#FF3B30 size=15 font=Menlo-Bold")
-            else:
-                print(f":bell.fill: {meeting_name} in {countdown} | color=#FF9999 size=15 font=Menlo-Bold")
+            color = "#FF3B30" if blink_on else "#FF9999"
+            print(f":bell.fill: {meeting_name} in {countdown} | color={color} size=15 font=Menlo-Bold")
         else:
-            # Red as soon as music starts
             print(f":bell.fill: {meeting_name} in {countdown} | color=#FF3B30 size=15 font=Menlo-Bold")
 
         print("---")
@@ -209,11 +229,11 @@ def main():
         print(f"Stop Music | {stop_cmd}")
         return
 
-    # More than lead_time away - show time until meeting
-    if seconds_left <= 300:  # Within 5 minutes, show countdown
+    # More than lead_time away
+    if seconds_left <= 300:
         countdown = format_countdown(seconds_left)
         print(f":bell.fill: {meeting_name} in {countdown} | size=15 font=Menlo-Bold")
-    elif seconds_left <= 3600:  # Within 1 hour
+    elif seconds_left <= 3600:
         mins = int(seconds_left / 60)
         print(f":bell.fill: {meeting_name} in {mins}m | size=15 font=Menlo-Bold")
     else:
@@ -221,11 +241,6 @@ def main():
 
     print("---")
     print(f"Next: {meeting_name} at {meeting_dt.strftime('%a %H:%M')} | size=15 font=Menlo-Bold")
-    print(f"Countdown starts {lead_time}s before | size=11 color=gray")
-    print(f"Audio: {'ready' if (SCRIPT_DIR / 'audio' / config.get('audio_file', 'channel12-intro.mp3')).exists() else 'MISSING - run download-audio.sh'} | size=11 color=gray")
-    print("---")
-    print(f"Edit Config | bash=open param1={CONFIG_PATH} terminal=false")
-    print(f"Edit Meetings | bash=open param1={CONFIG_PATH} terminal=false")
 
 
 if __name__ == "__main__":
